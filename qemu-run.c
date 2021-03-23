@@ -60,22 +60,34 @@ along with qemu-run; see the file LICENSE.  If not see <http://www.gnu.org/licen
 
 #include "config.h"
 
-enum {ERR_UNKOWN,ERR_ARGS,ERR_ENV,ERR_CONFIG,ERR_SYS,ERR_EXEC,ERR_MEM_INIT,ERR_ENDLIST};
+#if defined(_SVID_SOURCE) || defined(_BSD_SOURCE) || _XOPEN_SOURCE >= 500 || defined(_XOPEN_SOURCE) && defined(_XOPEN_SOURCE_EXTENDED)
+#else
+char *strdup(const char *s) {
+    size_t n = strlen(s)+1;
+    char *p = malloc(n);
+    if(p) memcpy(p, s, n);
+    //printf("strdup: source=%s, len=%lu, ret=%s\n", s, (unsigned long)n, p);
+    return p;
+}
+#endif
+
+enum {ERR_UNKOWN,ERR_ARGS,ERR_ENV,ERR_OPEN_CONFIG,ERR_FIND_CONFIG,ERR_SYS,ERR_EXEC,ERR_ENDLIST};
 void fatal(unsigned int errcode) {
 	char *errs[]={
+		"Unkown error.",
 		"Invalid argument count. Did you specified the VM Name?",
 		"Cannot find VM, Check your QEMURUN_VM_PATH env. variable?",
+		"Cannot find VM config file. Did you created it?",
 		"Cannot open config file. Check file permissions?",
-		"Invalid value for sys",
-		"There was an error trying to execute qemu. Do you have it installed?",
-		"Initilization or Memory error."
+		"Config file has an invalid value for sys.",
+		"There was an error trying to execute qemu. Do you have it installed?"
 	};
 	dprint();
 	printf("There was an error in the program:\n\t%s.\n",errs[errcode<ERR_ENDLIST?errcode:0]);
 	exit(1);
 }
 
-long sym_hash_generate(char *str) {
+void sym_hash_generate(char *str, char *hash_s) {
 	int pos=0; long hash=0xCAFEBABE;
 	while(str[pos]) {
 		hash=~(((((hash&0xFF)^str[pos])<<5)|
@@ -83,33 +95,22 @@ long sym_hash_generate(char *str) {
 			(hash<<18));
 		pos++;
 	}
-	return hash;
+	snprintf(hash_s, 9, "%8X", hash);
+	if(hash_s[0]==' ') { hash_s[0]='X';}
 }
 
 bool sym_put_kv(char *key,char *val) {
-	long hash,cnt=0,ret=0;
-	hash=sym_hash_generate(key);
+	int cnt=0,ret=0;
+	char hash[9]={0};
+	sym_hash_generate(key, &hash[0]);
 	while(cnt<KEY_ENDLIST) {
-		if(hash==cfg[cnt].hash) {
+		if(strcmp(cfg[cnt].hash, hash) == 0) {
 			ret=1;
 			cfg[cnt].val=strdup(val);
 		}
 		cnt++;
 	}
 	return ret;
-}
-
-char *append_to_char_arr(char *dst, const char *src, bool append_strterm, bool append_endchar, char endchar) {
-	char c; bool stop = 0;
-	dprint();
-	while (!stop) {
-		c = *src; src++;
-		if (c == '\0' && append_strterm) stop=1;
-		if (c == '\0' && !append_strterm) break;
-		*dst = c; dst++;
-	}
-	if (append_endchar) { *dst = endchar; dst++; }
-	return dst;
 }
 
 enum {FT_TYPE,FT_UNKNOWN=0,FT_PATH,FT_FILE};
@@ -123,32 +124,21 @@ int filetype(const char *fpath,int type) {
 }
 
 char* cstr_remove_quotes(char* c) {
-	size_t len = strlen(c);
 	dprint();
+	size_t len = strlen(c);
 	if (c[len-1] == '\"' && c[0] == '\"') {
 		c[len-1] = '\0';
 		return c+1;
 	} else { return c; }
 }
 
-size_t cstr_trim_right(const char *cstr, const size_t len) {
-	size_t diff = 0;
-	dprint();
-	for (size_t i = len - 1; i < len; i--) {
-		if (! isspace((int)cstr[i])) break;
-		diff++;
-	}
-	return len - diff;
-}
-
 #ifdef __WINDOWS__ // For now I only need this function on Windows.
 bool get_binary_full_path(const char *bin_fname, char *out_bin_fpath, char *out_dir) {
+	dprint();
 	bool found = 0;
 	char fpath_b[PATH_MAX], env_b[PATH_MAX*16], *env;
 	strcpy(env_b, (const char *)((env=getenv("PATH"))?env:""));
 	char *dir_p = strtok(env_b, PSEP);
-
-	dprint();
 	while (dir_p && !found) {
 		char* dir_pq = cstr_remove_quotes(dir_p);
 		snprintf(fpath_b, sizeof(fpath_b), "%s"DSEP"%s", dir_pq, bin_fname); found = filetype(fpath_b, FT_FILE);
@@ -163,83 +153,49 @@ bool get_binary_full_path(const char *bin_fname, char *out_bin_fpath, char *out_
 }
 #endif
 
-bool process_kv_pair(char *kv_cstr, char delim) {
-	bool rc = 0;
-	char val_buff[LINE_MAX], key_buff[LINE_MAX], *key_ptr, *val_ptr, *del_ptr;
-	size_t val_len = 0, key_len = 0;
-	dprint();
-#ifdef DEBUG
-	printf("process_kv_pair(\"%s\", '%c' (%d)))\n",kv_cstr,delim,delim);
-#endif
-	if((del_ptr=strchr(kv_cstr,delim))) {
-		key_ptr=kv_cstr;
-		while(key_ptr<del_ptr) {   // Adjust pointer, skip spaces
-			if(!(*key_ptr==' ' || *key_ptr=='\t')) break;
-			key_ptr++;
-		}
-		val_ptr=del_ptr+1;
-		while(--del_ptr>=key_ptr) { // Adjust end pointer, skip spaces
-			if(!(*del_ptr==' ' || *del_ptr=='\t')) break;
-		}
-		key_len=(del_ptr-key_ptr);
-		while(*val_ptr) {
-			if(!(*val_ptr==' ' || *val_ptr=='\t')) break;
-			val_ptr++;
-		}
-		val_len=0;
-		while(val_ptr[val_len]) val_len++;
-		while(val_len) {
-			if(!(val_ptr[val_len-1] == 0 || val_ptr[val_len-1]==' ' || val_ptr[val_len-1]=='\t')) break;
-			--val_len;
-		}
-	}
-	if(key_len) {
-		strncpy(key_buff,key_ptr,key_len);
-		if (val_len) {
-			strncpy(val_buff,val_ptr,val_len);
-		} else {
-			val_buff[0]=0;
-		}
-		rc=sym_put_kv(key_buff,val_buff);
-	}
-	return rc;
-}
-
 void program_load_config(const char *fpath) {
-	FILE *fptr = fopen(fpath, "r");
 	dprint();
+	FILE *fptr = fopen(fpath, "r");
 #ifdef DEBUG
 	printf("fpath=%s\n",fpath);
 #endif
-	if (!fptr) { fatal(ERR_CONFIG); }
-	char line[LINE_AVG*2];
+	if (!fptr) { fatal(ERR_OPEN_CONFIG); }
+	char line[LINE_AVG*2] = {0}, key[LINE_AVG]={0}, val[LINE_AVG]={0};
 	while(fgets(line, LINE_AVG*2, fptr)) {
-		// This code removes end lines, for Unix & Windows
-		size_t ll = strlen(line);
-		if (line[ll-2] == '\r') { ll--; line[ll-1] = '\0'; } 
-		if (line[ll-1] == '\n') { ll--; line[ll] = '\0'; }
-		process_kv_pair(line, '=');
+		if(!strchr(line, '=') || line[0] == '#') { continue; }
+		size_t len = strlen(line);
+		if (len && line[len-2] == '\r') { len--; line[len-1] = '\0'; } 
+		if (len && line[len-1] == '\n') { len--; line[len] = '\0'; }
+		if (len<3) { continue; }
+		char* slice = strtok(line, "=");
+		for(int i = 0; slice && i<2; i++) {
+			if (i==0) { strcpy(key, slice); }
+			if (i==1) { strcpy(val, slice); break; }
+			slice = strtok(NULL, "=");
+		}
+		sym_put_kv(key, val);
 	}
 	fclose(fptr);
 }
 
-void program_set_default_cfg_values(char *vm_dir) {
-	char path_buff[PATH_MAX];
+void program_set_default_cfg_values() {
 	dprint();
 #ifdef __WINDOWS__
 	sym_put_kv("acc", "no");
 	sym_put_kv("cpu", "max");
 	sym_put_kv("rng_dev", "no");
-	sym_put_kv("net", "e1000"); // virtio-pci-net is not supported on Windows.
 #endif
-	snprintf(path_buff, PATH_MAX, "%s"DSEP"shared", vm_dir);
-	sym_put_kv("shared", filetype(path_buff,FT_PATH) ? path_buff : "");
-	snprintf(path_buff, PATH_MAX, "%s"DSEP"floppy", vm_dir);
-	sym_put_kv("floppy", filetype(path_buff,FT_FILE) ? path_buff : "");
-	snprintf(path_buff, PATH_MAX, "%s"DSEP"cdrom", vm_dir);
-	sym_put_kv("cdrom", filetype(path_buff,FT_FILE) ? path_buff : "");
-	snprintf(path_buff, PATH_MAX, "%s"DSEP"disk", vm_dir);
-	sym_put_kv("disk", filetype(path_buff,FT_FILE) ? path_buff : "");
+	/* Because now qemu-run chdirs into vm_dir,
+	it's not needed to append vm_dir to the filename. */
+	if (filetype("shared",FT_PATH))			{ sym_put_kv("shared", "shared"); }
+	if (filetype("floppy", FT_FILE)) 		{ sym_put_kv("floppy", "floppy"); }
+	if (filetype("floppy.img", FT_FILE)) 	{ sym_put_kv("floppy", "floppy.img"); }
+	if (filetype("cdrom", FT_FILE))			{ sym_put_kv("cdrom", "cdrom"); }
+	if (filetype("cdrom.iso", FT_FILE))		{ sym_put_kv("cdrom", "cdrom.iso"); }
+	if (filetype("disk", FT_FILE))			{ sym_put_kv("disk", "disk"); }
+	if (filetype("disk.qcow2", FT_FILE))	{ sym_put_kv("disk", "disk.qcow2"); }
+	if (filetype("disk.raw", FT_FILE))		{ sym_put_kv("disk", "disk.raw"); }
+	if (filetype("disk.img", FT_FILE))		{ sym_put_kv("disk", "disk.img"); }
 }
 
 void program_build_cmd_line(char *vm_name, char *out_cmd) {
@@ -353,37 +309,37 @@ void program_build_cmd_line(char *vm_name, char *out_cmd) {
 	if (vm_clock_is_localtime) out_cmd = strcat(out_cmd, " -rtc base=localtime");
 }
 
-void program_find_vm_location(int argc, char **argv, char *out_vm_name, char *out_vm_dir, char *out_vm_cfg_file) {
-	char *vm_name, vm_dir[PATH_MAX+1], vm_dir_env_str[PATH_MAX*16],*env;
-	bool vm_dir_exists = 0;
+void program_find_vm_and_chdir(int argc, char **argv, char *out_vm_name, char *out_vm_cfg_file) {
+	char vm_dir[PATH_MAX+1], *env, *env_dir;
+	bool vm_dir_exists = 0, cfg_file_exists = 0;
 	dprint();
-	if (argc < 1) { fatal(ERR_ARGS); }
-	vm_name = argv[1];
-	strcpy(vm_dir_env_str, (const char *)((env=getenv("QEMURUN_VM_PATH"))?env:""));
-	char *vm_dir_env = strtok(vm_dir_env_str, PSEP);
-	while ( vm_dir_env && vm_dir_exists == 0 ) {
-		snprintf(vm_dir, PATH_MAX, "%s"DSEP"%s", cstr_remove_quotes(vm_dir_env), vm_name);
+	if (argc < 2) { fatal(ERR_ARGS); }
+	strcpy(out_vm_name, argv[1]);
+	env = getenv("QEMURUN_VM_PATH");
+	if (!env) { fatal(ERR_ENV); }
+	env_dir = strtok(env, PSEP);
+	while ( env_dir && !vm_dir_exists ) {
+		char* env_dir_q = cstr_remove_quotes(env_dir);
+		snprintf(vm_dir, PATH_MAX, "%s"DSEP"%s", env_dir_q, out_vm_name);
 		vm_dir_exists = filetype(vm_dir,FT_PATH);
-		vm_dir_env = strtok(NULL, PSEP);
+		env_dir = strtok(NULL, PSEP);
 	}
 	if (! vm_dir_exists) { fatal(ERR_ENV); }
-	char cfg_file[PATH_MAX+8];
-	snprintf(cfg_file, sizeof(cfg_file), "%s"DSEP"config", vm_dir); // @TODO: This breaks paths that are wrapped in quotes.
-	strcpy(out_vm_name, vm_name);
-	strcpy(out_vm_dir, vm_dir);
-	strcpy(out_vm_cfg_file, cfg_file);
+	chdir(vm_dir);
+	strcpy(out_vm_cfg_file, "config"); cfg_file_exists = filetype(out_vm_cfg_file, FT_FILE);
+	if (! cfg_file_exists) { strcpy(out_vm_cfg_file, "config.ini"); cfg_file_exists = filetype(out_vm_cfg_file, FT_FILE); }
+	if (! cfg_file_exists) { fatal(ERR_FIND_CONFIG); }
 }
 
 int main(int argc, char **argv) {
-	char cmd[LINE_MAX];
-	char vm_name[LINE_AVG], vm_dir[PATH_MAX+1], vm_cfg_file[LINE_AVG];
+	char cmd[LINE_MAX], vm_name[LINE_AVG], vm_cfg_file[LINE_AVG];
 	dprint();
 	puts_gpl_banner();
-	program_find_vm_location(argc, argv, vm_name, vm_dir, vm_cfg_file);
-	program_set_default_cfg_values(vm_dir);
+	program_find_vm_and_chdir(argc, argv, vm_name, vm_cfg_file);
+	program_set_default_cfg_values();
 	program_load_config(vm_cfg_file);
 #ifdef DEBUG
-	puts("Hash table:"); for(int i=0;i<KEY_ENDLIST;i++) printf("%d %X='%s'\n",i,cfg[i].hash,cfg[i].val);
+	puts("Hash table:"); for(int i=0;i<KEY_ENDLIST;i++) printf("%d 0x%8.8X='%s'\n",i,cfg[i].hash,cfg[i].val);
 #endif
 	program_build_cmd_line(vm_name, cmd);
 	puts("QEMU Command line arguments:");

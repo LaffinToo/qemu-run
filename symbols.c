@@ -146,10 +146,11 @@ st_symbols *sym_find_key(char *name)
 
 int sym_add(char *key,char *val)
 {
+   static const char* empty_str="";
    long hash;
    st_syminfo *si;
    st_symbols *sym;
-
+   if(!val) val = empty_str;
    si=sym_base();
    hash=sym_hash_generate(key,0);
    if(!si->count) {

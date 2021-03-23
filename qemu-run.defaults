@@ -1,4 +1,3 @@
-vm_name=
 sys=x64
 efi=no
 cpu=host
@@ -10,7 +9,7 @@ snd=hda
 boot=c
 fwd_ports=2222:22
 hdd_virtio=yes
-net=virtio-pci-net
+net=e1000
 rng_dev=yes
 host_video_acc=no
 localtime=no
